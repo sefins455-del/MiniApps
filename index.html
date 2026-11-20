@@ -1,0 +1,672 @@
+"""
+MINI APP для «Авто Вывода» (vyvod.py): те же функции, что в боте, но в приложении внутри Telegram.
+
+Как это работает:
+  • miniapp.py НЕ отдельный сервис, а часть бота: vyvod.py сам запускает его в отдельном потоке
+    (достаточно положить файл рядом с vyvod.py) и отдаёт ему свою базу и функции.
+  • Всё хранится в одной базе (vyvod.db): что поменял в боте, сразу видно в Mini App (обновляется каждые
+    4 секунды), и наоборот: что поменял в Mini App, сразу работает в боте.
+  • Вход только из Telegram: каждый запрос проверяется по подписи Telegram (initData).
+  • Владелец видит панель управления, игроки видят свой обмен, историю и чат с поддержкой.
+
+Что нужно:
+  1. Публичный HTTPS-адрес (Mini App в Telegram работает только по https). Сервер слушает порт PORT
+     (или MINIAPP_PORT, по умолчанию 8080); на хостинге укажи его домен, либо пробрось порт через
+     Cloudflare Tunnel / ngrok / nginx.
+  2. Переменная MINIAPP_URL=https://твой-домен: бот добавит кнопку «📱 Mini App» в меню и сообщения.
+  3. Зависимостей нет: только стандартная библиотека Python.
+"""
+import hashlib
+import hmac
+import json
+import logging
+import os
+import threading
+import time
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+APP = None  # модуль vyvod: база, настройки и функции бота
+
+
+class ApiError(Exception):
+    pass
+
+
+# ======================= ПРОВЕРКА ПОДПИСИ TELEGRAM =======================
+def verify_init_data(init_data, token, max_age=86400):
+    """Проверяет подпись Telegram WebApp initData. Возвращает данные пользователя или None."""
+    try:
+        pairs = dict(urllib.parse.parse_qsl(init_data or "", keep_blank_values=True))
+        got = pairs.pop("hash", None)
+        if not got:
+            return None
+        check = "\n".join(f"{k}={v}" for k, v in sorted(pairs.items()))
+        secret = hmac.new(b"WebAppData", token.encode(), hashlib.sha256).digest()
+        calc = hmac.new(secret, check.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(calc, got):
+            return None
+        if time.time() - int(pairs.get("auth_date", "0")) > max_age:
+            return None
+        user = json.loads(pairs.get("user", "{}"))
+        return user if user.get("id") else None
+    except Exception:
+        return None
+
+
+def _owner(uid):
+    if uid != APP.OWNER_ID:
+        raise ApiError("Нет доступа")
+
+
+def _name(user):
+    n = " ".join(x for x in (user.get("first_name"), user.get("last_name")) if x)
+    return n or user.get("username") or "Игрок"
+
+
+def _int(b, key, lo=None):
+    try:
+        v = int(b.get(key))
+    except (TypeError, ValueError):
+        raise ApiError(f"Нужно число: {key}")
+    if lo is not None and v < lo:
+        raise ApiError(f"Неверное значение: {key}")
+    return v
+
+
+def _float(b, key):
+    try:
+        v = float(str(b.get(key)).replace(",", "."))
+    except (TypeError, ValueError):
+        raise ApiError(f"Нужно число: {key}")
+    if v <= 0:
+        raise ApiError("Сумма должна быть больше нуля")
+    return v
+
+
+# ======================= API: ВСЕМ =======================
+def api_me(uid, user, b):
+    return {"owner": uid == APP.OWNER_ID, "id": uid, "name": _name(user)}
+
+
+def api_info(uid, user, b):
+    rate, level, nxt, vol = APP.tier_info(uid)
+    n, _ = APP.queue_totals()
+    show = APP.S("show_bank") == "1" and APP.S("bank_on") == "1"
+    bank = APP.bank_total() if show else None
+    ok, why = APP.exch_ready()
+    return {
+        "on": APP.S("exch_on") == "1", "ready": ok, "why": why, "rate": rate, "level": level,
+        "next": {"threshold": nxt[0], "rate": nxt[1]} if nxt else None, "volume": vol,
+        "bank": bank, "max_pr": (bank / rate) if (show and rate) else None, "queue": n,
+        "saved_id": APP.saved_id(uid), "pay_bot": APP.PAY_BOT,
+    }
+
+
+def api_history(uid, user, b):
+    rows = APP.q("SELECT id, ts, pr_amount, payout, to_id, status FROM exchanges "
+                 "WHERE user_id=? AND status!='activating' ORDER BY id DESC LIMIT 30", (uid,))
+    return {"rows": [{"id": i, "ts": ts, "pr": p or 0, "payout": o or 0, "to_id": to, "status": st} for i, ts, p, o, to, st in rows]}
+
+
+def api_setid(uid, user, b):
+    v = str(b.get("id", "")).strip()
+    if not v.isdigit() or not 5 <= len(v) <= 12:
+        raise ApiError("ID — от 5 до 12 цифр")
+    APP.q("INSERT OR REPLACE INTO payout_ids(user_id, to_id) VALUES(?,?)", (uid, int(v)))
+    return {"msg": "ID сохранён"}
+
+
+def api_exchange(uid, user, b):
+    links = APP.find_pay_links(str(b.get("link", "")))
+    if not links:
+        raise ApiError("Не вижу ссылку на чек вида t.me/pr_gramapp?start=check_...")
+    to_id = str(b.get("to_id", "")).strip()
+    if not to_id.isdigit() or not 5 <= len(to_id) <= 12:
+        raise ApiError("ID для выплаты — от 5 до 12 цифр")
+    if APP.is_banned(uid) or APP.is_banned(int(to_id)):
+        raise ApiError("Недоступно")
+    ok, why = APP.exch_ready()
+    if not ok:
+        raise ApiError(why)
+    if b.get("remember"):
+        APP.q("INSERT OR REPLACE INTO payout_ids(user_id, to_id) VALUES(?,?)", (uid, int(to_id)))
+    text = APP.ub_call(APP.exchange_flow(uid, _name(user), links[0][1], int(to_id), uid), timeout=300)
+    return {"text": text}
+
+
+def api_fixid(uid, user, b):
+    row = APP.q("SELECT id FROM exchanges WHERE user_id=? AND status='need_id' ORDER BY id DESC LIMIT 1", (uid,), one=True)
+    if not row:
+        raise ApiError("Нечего исправлять")
+    v = str(b.get("id", "")).strip()
+    if not v.isdigit() or not 5 <= len(v) <= 12:
+        raise ApiError("ID — от 5 до 12 цифр")
+    APP.apply_fix(uid, uid, row[0], v)
+    return {"msg": "Отправляю GRAM на новый ID"}
+
+
+def _thread(tid):
+    rows = APP.q("SELECT sender, text, ts FROM ticket_msgs WHERE ticket_id=? ORDER BY id DESC LIMIT 100", (tid,))
+    return [{"from": s, "text": t, "ts": ts} for s, t, ts in reversed(rows)]
+
+
+def api_psup(uid, user, b):
+    t = APP.q("SELECT id, status FROM tickets WHERE user_id=? ORDER BY id DESC LIMIT 1", (uid,), one=True)
+    if not t:
+        return {"ticket": None, "status": None, "messages": []}
+    return {"ticket": t[0], "status": t[1], "messages": _thread(t[0])}
+
+
+def api_psup_send(uid, user, b):
+    if APP.is_banned(uid):
+        raise ApiError("Недоступно")
+    try:
+        tid = APP.support_user_message(uid, _name(user), user.get("username") or "", str(b.get("text", "")))
+    except ValueError as e:
+        raise ApiError(str(e))
+    return {"ticket": tid, "msg": "Отправлено"}
+
+
+# ======================= API: ВЛАДЕЛЬЦУ =======================
+def api_dash(uid, user, b):
+    _owner(uid)
+    n, qs = APP.queue_totals()
+    day = APP.q("SELECT COUNT(*), COALESCE(SUM(payout),0) FROM exchanges WHERE status='paid' AND ts>?",
+                (time.time() - 86400,), one=True)
+    return {"on": APP.S("exch_on") == "1", "rate": APP.fl("rate", 0.4), "bank": APP.bank_total(),
+            "accounts": len(APP.payer_candidates()), "queue": {"n": n, "sum": qs}, "day": {"n": day[0], "sum": day[1]},
+            "need": APP.need_list(), "forecast": APP.bank_forecast(), "support_open": APP.open_tickets(),
+            "show_bank": APP.S("show_bank") == "1"}
+
+
+def api_toggle(uid, user, b):
+    _owner(uid)
+    if APP.S("exch_on") == "1":
+        APP.setS("exch_on", "0")
+        return {"msg": "Обмен выключен"}
+    need = [x for x in APP.need_list() if x != "банк пуст"]
+    if need:
+        raise ApiError("Сначала настрой в боте (/setup): " + ", ".join(need))
+    APP.setS("exch_on", "1")
+    return {"msg": "Обмен включён"}
+
+
+def api_bank(uid, user, b):
+    _owner(uid)
+    accs = []
+    for pid in APP.known_payer_ids():
+        ready = APP.ub_ready if pid == 0 else pid in APP.payer_clients
+        row = None if pid == 0 else APP.q("SELECT enabled FROM payers WHERE id=?", (pid,), one=True)
+        accs.append({"id": pid, "name": APP.payer_name(pid), "bank": APP.get_bank(pid), "ready": bool(ready),
+                     "enabled": True if pid == 0 else bool(row and row[0])})
+    n, qs = APP.queue_totals()
+    return {"accounts": accs, "quick": APP.quick_amounts(), "queue": {"n": n, "sum": qs}, "total": APP.bank_total(),
+            "need": max(0.0, qs - APP.bank_total()), "forecast": APP.bank_forecast(), "bank_on": APP.S("bank_on") == "1"}
+
+
+def api_bank_add(uid, user, b):
+    _owner(uid)
+    pid, amount = _int(b, "pid", 0), _float(b, "amount")
+    if pid not in APP.known_payer_ids():
+        raise ApiError("Такого аккаунта выплат нет")
+    new = APP.add_bank(pid, amount)
+    paid = APP.flush_queue()
+    return {"bank": new, "paid": paid, "msg": f"Банк #{pid}: {new:g} GRAM" + (f" · выплачено из очереди: {paid}" if paid else "")}
+
+
+def api_flush(uid, user, b):
+    _owner(uid)
+    n = APP.flush_queue()
+    return {"paid": n, "msg": f"Из очереди выплачено: {n}" if n else "Очередь пуста или банка не хватает"}
+
+
+def api_sync(uid, user, b):
+    _owner(uid)
+    try:
+        n = APP.ub_call(APP.sync_banks(), timeout=180)
+    except Exception as e:
+        raise ApiError(str(e))
+    if not n:
+        raise ApiError("Не удалось: проверь «Команду баланса» в настройках и что аккаунт подключён")
+    return {"msg": f"Обновлено аккаунтов: {n}"}
+
+
+def api_log(uid, user, b):
+    _owner(uid)
+    rows = APP.q("SELECT id, name, pr_amount, payout, to_id, status, ts, note FROM exchanges "
+                 "WHERE status!='activating' ORDER BY id DESC LIMIT 40")
+    return {"rows": [{"id": i, "name": n, "pr": p or 0, "payout": o or 0, "to_id": to, "status": st, "ts": ts, "note": nt or ""}
+                     for i, n, p, o, to, st, ts, nt in rows]}
+
+
+def api_retry(uid, user, b):
+    _owner(uid)
+    rid = _int(b, "id", 1)
+    try:
+        text = APP.ub_call(APP.do_payout(rid, tell_user=True), timeout=300)
+    except Exception as e:
+        raise ApiError(str(e))
+    return {"msg": text[:120]}
+
+
+def api_mark(uid, user, b):
+    _owner(uid)
+    rid, to = _int(b, "id", 1), str(b.get("to"))
+    if to not in ("paid", "fail"):
+        raise ApiError("Неверный статус")
+    row = APP.q("SELECT payout, payer FROM exchanges WHERE id=?", (rid,), one=True)
+    APP.qx("UPDATE exchanges SET status=? WHERE id=? AND status='review'", ("paid" if to == "paid" else "failed", rid))
+    if to == "fail" and row and row[1] is not None and APP.S("bank_on") == "1":
+        APP.add_bank(row[1], row[0])  # деньги не ушли: возвращаем в банк
+    return {"msg": "Отмечено"}
+
+
+def api_accounts(uid, user, b):
+    _owner(uid)
+    payers = [{"id": i, "name": n, "bank": bk, "enabled": bool(en), "ready": i in APP.payer_clients}
+              for i, n, bk, en in APP.payer_rows()]
+    return {"collector": {"ready": bool(APP.ub_ready), "name": APP.S("col_name")}, "payers": payers,
+            "main_mode": APP.S("pay_main_on"), "chat": APP.S("pay_chat_title") or APP.S("pay_target"),
+            "pay_bot": APP.S("pay_bot")}
+
+
+def api_acc_toggle(uid, user, b):
+    _owner(uid)
+    pid = _int(b, "pid", 1)
+    row = APP.q("SELECT enabled FROM payers WHERE id=?", (pid,), one=True)
+    if not row:
+        raise ApiError("Аккаунта нет")
+    APP.q("UPDATE payers SET enabled=? WHERE id=?", (0 if row[0] else 1, pid))
+    return {"msg": "Выключен" if row[0] else "Включён"}
+
+
+def api_acc_main(uid, user, b):
+    _owner(uid)
+    nxt = {"auto": "on", "on": "off"}.get(APP.S("pay_main_on"), "auto")
+    APP.setS("pay_main_on", nxt)
+    return {"msg": f"Сборщик тоже платит: {nxt}"}
+
+
+def api_settings(uid, user, b):
+    _owner(uid)
+    items = [{"key": k, "label": lb, "hint": h, "value": APP.S(k)} for k, lb, h in APP.SET_ITEMS]
+    toggles = [{"key": k, "label": lb, "on": APP.S(k) == "1"} for k, lb in APP.TOGGLES]
+    return {"items": items, "toggles": toggles}
+
+
+def api_set(uid, user, b):
+    _owner(uid)
+    key = str(b.get("key"))
+    if key not in {k for k, _, _ in APP.SET_ITEMS}:
+        raise ApiError("Неизвестная настройка")
+    ok, msg = APP.apply_setting(key, str(b.get("value", "")))
+    if not ok:
+        raise ApiError(msg.replace("⚠️ ", ""))
+    return {"msg": "Сохранено"}
+
+
+def api_tg(uid, user, b):
+    _owner(uid)
+    key = str(b.get("key"))
+    if key not in dict(APP.TOGGLES):
+        raise ApiError("Неизвестный переключатель")
+    APP.setS(key, "0" if APP.S(key) == "1" else "1")
+    return {"msg": "Включено" if APP.S(key) == "1" else "Выключено"}
+
+
+def api_stats(uid, user, b):
+    _owner(uid)
+    now = time.time()
+
+    def agg(since):
+        r = APP.q("SELECT COUNT(*), COALESCE(SUM(pr_amount),0), COALESCE(SUM(payout),0) FROM exchanges WHERE status='paid' AND ts>?",
+                  (since,), one=True)
+        return {"n": r[0], "pr": r[1], "out": r[2]}
+
+    top = APP.q("SELECT name, SUM(payout) s FROM exchanges WHERE status='paid' GROUP BY user_id ORDER BY s DESC LIMIT 5")
+    n, qs = APP.queue_totals()
+    return {"day": agg(now - 86400), "week": agg(now - 7 * 86400), "all": agg(0), "top": [{"name": a, "sum": s} for a, s in top],
+            "queue": {"n": n, "sum": qs}, "users": APP.q("SELECT COUNT(*) FROM users", one=True)[0],
+            "bad": APP.q("SELECT COUNT(*) FROM exchanges WHERE status IN ('failed','review')", one=True)[0]}
+
+
+def api_tickets(uid, user, b):
+    _owner(uid)
+    rows = APP.q("SELECT id, name, username, status, updated, unread FROM tickets ORDER BY (status='open') DESC, updated DESC LIMIT 40")
+    out = []
+    for i, n, un, st, up, unr in rows:
+        last = APP.q("SELECT text FROM ticket_msgs WHERE ticket_id=? ORDER BY id DESC LIMIT 1", (i,), one=True)
+        out.append({"id": i, "name": n, "username": un, "status": st, "updated": up, "unread": unr, "last": (last[0] if last else "")[:120]})
+    return {"rows": out}
+
+
+def api_ticket(uid, user, b):
+    _owner(uid)
+    tid = _int(b, "id", 1)
+    t = APP.q("SELECT user_id, name, username, status FROM tickets WHERE id=?", (tid,), one=True)
+    if not t:
+        raise ApiError("Обращение не найдено")
+    APP.q("UPDATE tickets SET unread=0 WHERE id=?", (tid,))
+    return {"id": tid, "user_id": t[0], "name": t[1], "username": t[2], "status": t[3], "messages": _thread(tid)}
+
+
+def api_ticket_reply(uid, user, b):
+    _owner(uid)
+    try:
+        APP.support_owner_reply(_int(b, "id", 1), str(b.get("text", "")))
+    except ValueError as e:
+        raise ApiError(str(e))
+    return {"msg": "Отправлено"}
+
+
+def api_ticket_close(uid, user, b):
+    _owner(uid)
+    try:
+        APP.support_close(_int(b, "id", 1))
+    except ValueError as e:
+        raise ApiError(str(e))
+    return {"msg": "Обращение закрыто"}
+
+
+ROUTES = {
+    "me": api_me, "info": api_info, "history": api_history, "setid": api_setid, "exchange": api_exchange,
+    "fixid": api_fixid, "psup": api_psup, "psup_send": api_psup_send,
+    "dash": api_dash, "toggle": api_toggle, "bank": api_bank, "bank_add": api_bank_add, "flush": api_flush,
+    "sync": api_sync, "log": api_log, "retry": api_retry, "mark": api_mark, "accounts": api_accounts,
+    "acc_toggle": api_acc_toggle, "acc_main": api_acc_main, "settings": api_settings, "set": api_set,
+    "tg": api_tg, "stats": api_stats, "tickets": api_tickets, "ticket": api_ticket,
+    "ticket_reply": api_ticket_reply, "ticket_close": api_ticket_close,
+}
+
+
+# ======================= HTTP-СЕРВЕР =======================
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def _send(self, code, body, ctype="application/json; charset=utf-8"):
+        data = body if isinstance(body, bytes) else body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _json(self, code, obj):
+        self._send(code, json.dumps(obj, ensure_ascii=False))
+
+    def do_GET(self):
+        path = self.path.split("?")[0]
+        if path in ("/", "/index.html"):
+            return self._send(200, INDEX_HTML, "text/html; charset=utf-8")
+        if path == "/health":
+            return self._json(200, {"ok": True})
+        self._json(404, {"error": "not found"})
+
+    def do_POST(self):
+        path = self.path.split("?")[0]
+        if not path.startswith("/api/"):
+            return self._json(404, {"error": "not found"})
+        name = path[5:]
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(n) or b"{}") if n else {}
+            if not isinstance(body, dict):
+                raise ValueError
+        except Exception:
+            return self._json(400, {"error": "Неверный запрос"})
+        user = verify_init_data(self.headers.get("X-Init-Data", ""), APP.TOKEN)
+        if not user:
+            return self._json(401, {"error": "Открой Mini App из Telegram-бота"})
+        fn = ROUTES.get(name)
+        if not fn:
+            return self._json(404, {"error": "Неизвестный метод"})
+        try:
+            self._json(200, fn(int(user["id"]), user, body))
+        except ApiError as e:
+            self._json(403 if str(e) == "Нет доступа" else 400, {"error": str(e)})
+        except Exception as e:
+            logging.exception("miniapp api %s", name)
+            self._json(500, {"error": f"Ошибка сервера: {type(e).__name__}"})
+
+
+def start(app, port=None):
+    """Запускает сервер в отдельном потоке. app: модуль vyvod."""
+    global APP
+    APP = app
+    port = int(port or os.getenv("PORT") or os.getenv("MINIAPP_PORT") or 8080)
+    srv = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    logging.info("Mini App: порт %s · MINIAPP_URL=%s", port, os.getenv("MINIAPP_URL") or "не задан")
+    return srv
+
+
+# ======================= ИНТЕРФЕЙС =======================
+INDEX_HTML = r'''<!doctype html>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>Авто Вывод</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+:root{--bg:var(--tg-theme-bg-color,#fff);--fg:var(--tg-theme-text-color,#111);--hint:var(--tg-theme-hint-color,#8a8a8e);
+--btn:var(--tg-theme-button-color,#2481cc);--btnt:var(--tg-theme-button-text-color,#fff);--card:var(--tg-theme-secondary-bg-color,#f2f2f7);--red:#d9423c}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.4 -apple-system,system-ui,"Segoe UI",sans-serif;padding-bottom:76px}
+.card{background:var(--card);border-radius:14px;padding:12px;margin:10px}
+.row{display:flex;justify-content:space-between;align-items:center;gap:8px}
+.grid{display:grid;grid-template-columns:1fr 1fr}
+.big{font-size:24px;font-weight:700;margin:2px 0}
+.muted{color:var(--hint);font-size:13px}
+.warn{color:var(--red)}
+button{background:var(--btn);color:var(--btnt);border:0;border-radius:10px;padding:9px 12px;font-size:14px;margin:3px 3px 3px 0}
+button.wide{width:100%;margin:6px 0}
+button.danger{background:var(--red)}
+button.link{background:none;color:var(--btn);padding:0;margin:0 0 8px}
+input,textarea,select{width:100%;padding:10px;border-radius:10px;border:1px solid var(--hint);background:var(--bg);color:var(--fg);font-size:15px;margin:4px 0}
+.btns{display:flex;flex-wrap:wrap}
+.pad{padding:0 10px}
+.msg{padding:8px 10px;border-radius:12px;margin:6px 0;max-width:86%;white-space:pre-wrap;word-break:break-word}
+.msg.user{background:var(--card);margin-right:auto}
+.msg.owner{background:var(--btn);color:var(--btnt);margin-left:auto}
+.badge{background:var(--red);color:#fff;border-radius:10px;padding:1px 7px;font-size:12px}
+nav{position:fixed;bottom:0;left:0;right:0;display:flex;background:var(--card);padding:6px 4px calc(6px + env(safe-area-inset-bottom))}
+nav div{flex:1;text-align:center;font-size:11px;color:var(--hint);padding:4px 0}
+nav div b{display:block;font-size:20px;font-weight:400}
+nav div.on{color:var(--btn);font-weight:600}
+#toast{position:fixed;left:50%;bottom:90px;transform:translateX(-50%);background:#222;color:#fff;padding:9px 14px;border-radius:12px;opacity:0;transition:opacity .25s;pointer-events:none;max-width:90%;text-align:center;z-index:9}
+#toast.show{opacity:.95}
+h3{margin:12px 10px 0}
+</style></head>
+<body>
+<div id="static"></div>
+<div id="dyn"><div class="card muted">Загрузка…</div></div>
+<nav id="nav"></nav>
+<div id="toast"></div>
+<script>
+const tg = (window.Telegram && Telegram.WebApp) || {initData: '', ready() {}, expand() {}};
+tg.ready(); tg.expand();
+let ME = null, TAB = '', BUSY = false, TID = null, MORE = 'acc';
+const $ = s => document.querySelector(s);
+const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
+const n4 = v => Number(v || 0).toLocaleString('ru-RU', {maximumFractionDigits: 4});
+const dt = ts => new Date(ts * 1000).toLocaleString('ru-RU', {day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit'});
+const ICON = {paid: '✅', queued: '⏳', retry: '🔁', need_id: '❓', failed: '⚠️', review: '🔎', activated: '⏳', paying: '⏳'};
+
+async function api(name, body) {
+  const r = await fetch('/api/' + name, {method: 'POST', headers: {'Content-Type': 'application/json', 'X-Init-Data': tg.initData || ''}, body: JSON.stringify(body || {})});
+  const j = await r.json().catch(() => ({error: 'Ошибка ответа сервера'}));
+  if (!r.ok) throw new Error(j.error || ('Ошибка ' + r.status));
+  return j;
+}
+let toastTimer = null;
+function toast(t) {
+  const el = $('#toast'); el.textContent = t; el.classList.add('show');
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => el.classList.remove('show'), 2600);
+}
+async function act(name, body, okMsg) {
+  BUSY = true;
+  try { const r = await api(name, body); toast(r.msg || okMsg || 'Готово'); await refresh(true); return r; }
+  catch (e) { toast('⚠️ ' + e.message); }
+  finally { BUSY = false; }
+}
+
+const TABS = {
+  owner: [['dash', '🏠', 'Главная'], ['bank', '🏦', 'Банк'], ['log', '📜', 'Обмены'], ['sup', '🛟', 'Чат'], ['more', '⚙️', 'Ещё']],
+  player: [['ex', '🔄', 'Обмен'], ['hist', '📜', 'История'], ['psup', '🛟', 'Поддержка']]
+};
+function renderNav() {
+  $('#nav').innerHTML = TABS[ME.owner ? 'owner' : 'player'].map(t =>
+    `<div id="t_${t[0]}" onclick="go('${t[0]}')"><b>${t[1]}</b>${t[2]}</div>`).join('');
+}
+function thread(msgs) {
+  if (!msgs || !msgs.length) return '<div class="card muted">Сообщений пока нет</div>';
+  return '<div class="pad">' + msgs.map(m => `<div class="msg ${m.from}">${esc(m.text)}<div class="muted" style="color:inherit;opacity:.7">${dt(m.ts)}</div></div>`).join('') + '</div>';
+}
+
+const SCREENS = {};
+SCREENS.dash = {
+  load: () => api('dash'),
+  draw: d => `<div class="card"><div class="row"><b>${d.on ? '🟢 Работает' : '🔴 Выключен'}</b>
+      <button onclick="act('toggle')">${d.on ? 'Выключить' : 'Включить'}</button></div>
+      <div class="muted">Курс: 1 PR GRAM = ${n4(d.rate)} GRAM</div></div>
+    <div class="card"><div class="muted">Общий банк${d.show_bank ? ' (виден игрокам)' : ''}</div><div class="big">${n4(d.bank)} GRAM</div>
+      <div class="muted">${esc(d.forecast || '')}</div></div>
+    <div class="grid"><div class="card"><div class="muted">Очередь</div><div class="big">${d.queue.n}</div><div class="muted">${n4(d.queue.sum)} GRAM</div></div>
+      <div class="card"><div class="muted">За 24 часа</div><div class="big">${d.day.n}</div><div class="muted">${n4(d.day.sum)} GRAM</div></div></div>
+    ${d.need.length ? `<div class="card warn">⚠️ Не готово: ${esc(d.need.join(', '))}<div class="muted">Подключение аккаунтов и чата делается в боте: /setup</div></div>` : ''}
+    ${d.support_open ? `<div class="card" onclick="go('sup')">🛟 Открытых обращений: <b>${d.support_open}</b> <span class="muted">→</span></div>` : ''}`
+};
+SCREENS.bank = {
+  load: () => api('bank'),
+  draw: d => `<div class="card"><div class="muted">Всего в банке</div><div class="big">${n4(d.total)} GRAM</div>
+      <div class="muted">${esc(d.forecast || '')}</div>
+      ${d.need > 0 ? `<div class="warn">🧮 Для очереди не хватает: ${n4(d.need)} GRAM</div>` : ''}</div>`
+    + d.accounts.map(a => `<div class="card"><div class="row"><b>#${a.id} ${esc(a.name)}</b><span>${a.ready && a.enabled ? '🟢' : '🔴'}</span></div>
+        <div class="big">${n4(a.bank)} GRAM</div>
+        <div class="btns">${d.quick.map(q => `<button onclick="act('bank_add',{pid:${a.id},amount:${q}})">+${n4(q)}</button>`).join('')}</div>
+        ${d.need > 0 ? `<button class="wide" onclick="act('bank_add',{pid:${a.id},amount:${d.need}})">🧮 +${n4(d.need)} закрыть очередь</button>` : ''}
+        <div class="row"><input id="c${a.id}" type="number" inputmode="decimal" placeholder="Своя сумма"><button onclick="custom(${a.id})">Добавить</button></div></div>`).join('')
+    + `<div class="btns pad"><button onclick="act('flush')">⚡ Выплатить очередь</button><button onclick="act('sync')">🔄 Синхронизировать</button></div>`
+    + '<div class="muted pad">Перевёл GRAM на аккаунт выплат? Нажми сумму: банк обновится, очередь выплатится сама.</div>'
+};
+function custom(pid) { const v = parseFloat(($('#c' + pid).value || '').replace(',', '.')); if (!(v > 0)) return toast('Введи сумму'); act('bank_add', {pid, amount: v}); }
+
+SCREENS.log = {
+  load: () => api('log'),
+  draw: d => d.rows.map(r => `<div class="card"><div class="row"><b>#${r.id} ${esc(r.name)}</b><span>${ICON[r.status] || '•'} ${esc(r.status)}</span></div>
+      <div class="muted">${n4(r.pr)} PR → ${n4(r.payout)} GRAM · ID ${r.to_id} · ${dt(r.ts)}</div>
+      ${r.status === 'failed' ? `<button onclick="act('retry',{id:${r.id}})">🔁 Повторить</button>` : ''}
+      ${r.status === 'review' ? `<button onclick="act('mark',{id:${r.id},to:'paid'})">✅ Выплачено</button><button class="danger" onclick="act('mark',{id:${r.id},to:'fail'})">❌ Нет</button>` : ''}</div>`).join('')
+    || '<div class="card muted">Обменов пока нет</div>'
+};
+SCREENS.sup = {
+  static: () => TID === null ? '' : `<div class="card"><button class="link" onclick="TID=null;go('sup')">← К обращениям</button>
+      <textarea id="reply" rows="2" placeholder="Ответ игроку…"></textarea>
+      <div class="row"><button onclick="sendReply()">Отправить</button><button class="danger" onclick="closeTicket()">Закрыть обращение</button></div></div>`,
+  load: () => TID === null ? api('tickets') : api('ticket', {id: TID}),
+  draw: d => TID === null
+    ? (d.rows.map(t => `<div class="card" onclick="openTicket(${t.id})"><div class="row"><b>#${t.id} ${esc(t.name)}${t.username ? ' @' + esc(t.username) : ''}</b>
+        <span>${t.unread ? `<span class="badge">${t.unread}</span> ` : ''}${t.status === 'open' ? '🟢' : '✔️'}</span></div>
+        <div class="muted">${esc(t.last)}</div></div>`).join('') || '<div class="card muted">Обращений пока нет</div>')
+    : `<div class="card"><b>#${d.id} ${esc(d.name)}${d.username ? ' @' + esc(d.username) : ''}</b> <span class="muted">· ${d.status === 'open' ? 'открыто' : 'закрыто'} · ID ${d.user_id}</span></div>` + thread(d.messages)
+};
+function openTicket(id) { TID = id; go('sup'); }
+async function sendReply() {
+  const t = $('#reply').value.trim(); if (!t) return;
+  const r = await act('ticket_reply', {id: TID, text: t}); if (r) $('#reply').value = '';
+}
+async function closeTicket() { if (await act('ticket_close', {id: TID})) { TID = null; go('sup'); } }
+
+SCREENS.more = {
+  static: () => `<div class="btns pad" style="margin-top:8px">${[['acc', 'Аккаунты'], ['set', 'Настройки'], ['stats', 'Статистика']].map(x =>
+    `<button style="opacity:${MORE === x[0] ? 1 : .55}" onclick="MORE='${x[0]}';go('more')">${x[1]}</button>`).join('')}</div>`,
+  load: () => MORE === 'acc' ? api('accounts') : MORE === 'set' ? api('settings') : api('stats'),
+  poll: () => MORE !== 'set',
+  draw: d => MORE === 'acc' ? `<div class="card"><b>📥 Сборщик чеков:</b> ${d.collector.ready ? '🟢 ' + esc(d.collector.name || 'подключён') : '🔴 не подключён'}</div>
+      <div class="card"><b>💬 Чат выплат:</b> ${esc(d.chat || 'не подключён')}<div class="muted">Бот в чате: @${esc(d.pay_bot)}</div></div>`
+      + d.payers.map(p => `<div class="card"><div class="row"><b>#${p.id} ${esc(p.name)}</b><span>${!p.enabled ? '⏸' : p.ready ? '🟢' : '🔴'}</span></div>
+          <div class="muted">Банк: ${n4(p.bank)} GRAM</div><button onclick="act('acc_toggle',{pid:${p.id}})">${p.enabled ? '⏸ Выключить' : '▶️ Включить'}</button></div>`).join('')
+      + `<div class="card"><div class="row"><span>Сборщик тоже платит: <b>${esc(d.main_mode)}</b></span><button onclick="act('acc_main')">Сменить</button></div></div>
+         <div class="card muted">Вход в аккаунты, подключение чата и тест-выплата делаются в боте: /setup</div>`
+    : MORE === 'set' ? d.toggles.map(t => `<div class="card row"><span>${esc(t.label)}</span><button class="${t.on ? '' : 'danger'}" onclick="act('tg',{key:'${t.key}'})">${t.on ? 'вкл' : 'выкл'}</button></div>`).join('')
+      + d.items.map(i => `<div class="card"><b>${esc(i.label)}</b><div class="muted">${esc(i.hint)}</div>
+          <input id="s_${i.key}" value="${esc(i.value)}"><button onclick="saveSetting('${i.key}')">💾 Сохранить</button></div>`).join('')
+    : `<div class="card"><b>24 часа:</b> ${d.day.n} обм. · ${n4(d.day.pr)} PR → ${n4(d.day.out)} GRAM<br>
+        <b>7 дней:</b> ${d.week.n} обм. · ${n4(d.week.pr)} PR → ${n4(d.week.out)} GRAM<br>
+        <b>Всего:</b> ${d.all.n} обм. · ${n4(d.all.pr)} PR → ${n4(d.all.out)} GRAM</div>
+       <div class="card">Очередь: ${d.queue.n} на ${n4(d.queue.sum)} GRAM · требуют внимания: ${d.bad} · людей: ${d.users}</div>
+       ${d.top.length ? `<div class="card"><b>Топ:</b><br>${d.top.map(t => esc(t.name) + ' — ' + n4(t.sum)).join('<br>')}</div>` : ''}`
+};
+function saveSetting(key) { act('set', {key, value: $('#s_' + key).value}); }
+
+SCREENS.ex = {
+  static: () => `<div class="card"><b>🔄 Обмен PR GRAM → GRAM</b>
+      <input id="lnk" placeholder="Ссылка на чек: t.me/pr_gramapp?start=check_…">
+      <input id="toid" type="number" inputmode="numeric" placeholder="ID, на который отправить GRAM">
+      <label class="muted"><input type="checkbox" id="rem" style="width:auto"> запомнить ID</label>
+      <button class="wide" onclick="doExchange()">Обменять</button><div id="exres" class="muted"></div></div>`,
+  load: () => api('info'),
+  draw: d => { if (d.saved_id && !$('#toid').value && !window.__idset) { $('#toid').value = d.saved_id; window.__idset = 1; }
+    return `<div class="card"><div class="muted">Курс</div><div class="big">1 PR = ${n4(d.rate)} GRAM</div>
+      ${d.level ? `<div class="muted">Твой уровень: ${d.level}</div>` : ''}
+      ${d.next ? `<div class="muted">До курса ${n4(d.next.rate)}: ещё ${n4(d.next.threshold - d.volume)} PR GRAM</div>` : ''}</div>
+      ${d.bank != null ? `<div class="card"><div class="muted">🏦 Общий банк</div><div class="big">${n4(d.bank)} GRAM</div>
+        <div class="muted">Хватит на чек до ${n4(d.max_pr)} PR GRAM${d.queue ? ` · в очереди: ${d.queue}` : ' · выплаты идут сразу'}</div></div>` : ''}
+      ${!d.ready ? `<div class="card warn">${esc(d.why)}</div>` : '<div class="card muted">Любые суммы выплачиваются автоматически, без подтверждений.</div>'}`; }
+};
+async function doExchange() {
+  const link = $('#lnk').value.trim(), to_id = $('#toid').value.trim();
+  if (!link || !to_id) return toast('Вставь ссылку на чек и ID');
+  BUSY = true; $('#exres').textContent = '⏳ Активирую чек и отправляю GRAM…';
+  try { const r = await api('exchange', {link, to_id, remember: $('#rem').checked}); $('#exres').textContent = r.text; $('#lnk').value = ''; }
+  catch (e) { $('#exres').textContent = '⚠️ ' + e.message; }
+  finally { BUSY = false; }
+}
+SCREENS.hist = {
+  load: () => api('history'),
+  draw: d => d.rows.map(r => `<div class="card"><div class="row"><b>#${r.id}</b><span>${ICON[r.status] || '•'} ${esc(r.status)}</span></div>
+      <div class="muted">${n4(r.pr)} PR → ${n4(r.payout)} GRAM · ID ${r.to_id} · ${dt(r.ts)}</div>
+      ${r.status === 'need_id' ? `<div class="warn">Бот выплат не нашёл этот ID</div><input id="fix${r.id}" type="number" placeholder="Правильный ID"><button onclick="fixId(${r.id})">Отправить на новый ID</button>` : ''}</div>`).join('')
+    || '<div class="card muted">Обменов пока нет</div>'
+};
+function fixId(i) { act('fixid', {id: $('#fix' + i).value}); }
+SCREENS.psup = {
+  static: () => `<div class="card"><b>🛟 Поддержка</b><div class="muted">Напиши вопрос: ответ придёт сюда и в бота.</div>
+      <textarea id="ptext" rows="3" placeholder="Сообщение…"></textarea><button class="wide" onclick="sendSupport()">Отправить</button></div>`,
+  load: () => api('psup'),
+  draw: d => thread(d.messages)
+};
+async function sendSupport() {
+  const t = $('#ptext').value.trim(); if (!t) return;
+  const r = await act('psup_send', {text: t}); if (r) $('#ptext').value = '';
+}
+
+async function go(tab) {
+  TAB = tab;
+  document.querySelectorAll('nav div').forEach(e => e.classList.toggle('on', e.id === 't_' + tab));
+  const s = SCREENS[tab];
+  $('#static').innerHTML = s.static ? s.static() : '';
+  $('#dyn').innerHTML = '<div class="card muted">Загрузка…</div>';
+  window.scrollTo(0, 0);
+  await refresh(true);
+}
+async function refresh(force) {
+  const s = SCREENS[TAB]; if (!s) return;
+  const a = document.activeElement;
+  if (!force && a && $('#dyn').contains(a) && /INPUT|TEXTAREA/.test(a.tagName)) return;
+  if (!force && s.poll && !s.poll()) return;
+  try { const d = await s.load(); const tab = TAB; const html = s.draw(d); if (tab === TAB) $('#dyn').innerHTML = html; }
+  catch (e) { $('#dyn').innerHTML = `<div class="card warn">⚠️ ${esc(e.message)}</div>`; }
+}
+async function boot() {
+  try { ME = await api('me'); }
+  catch (e) { document.body.innerHTML = '<div class="card">Открой Mini App из Telegram-бота.<div class="muted">' + esc(e.message) + '</div></div>'; return; }
+  renderNav(); go(ME.owner ? 'dash' : 'ex');
+  setInterval(() => { if (!document.hidden && !BUSY) refresh(false); }, 4000);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(true); });
+}
+boot();
+</script></body></html>
+'''
